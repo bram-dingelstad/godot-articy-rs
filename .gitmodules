@@ -1,0 +1,3 @@
+[submodule "articy-rs"]
+	path = articy-rs
+	url = git@github.com:bram-dingelstad/articy-rs.git
