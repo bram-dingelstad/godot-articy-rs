@@ -4,7 +4,6 @@ use articy::{
 };
 use gdnative::api::PackedDataContainer;
 use gdnative::prelude::*;
-use serde_json::Value;
 use std::rc::Rc;
 
 #[derive(NativeClass, Debug, Default)]
@@ -25,7 +24,7 @@ pub struct Dialogue {
 pub enum Error {
     DatabaseNotSetup,
     InterpreterNotSetup,
-    ArticyError, //FIXME: Add articy in tuple enum and handle ToVariant requirement (ArticyError),
+    ArticyError, //(articy::types::Error), //FIXME: Add articy in tuple enum and handle ToVariant requirement (ArticyError),
 }
 
 impl From<&types::Model> for Dialogue {
@@ -110,15 +109,15 @@ impl Database {
     }
 
     #[method]
-    fn get_models_of_type(&self, kind: String) -> Result<Vec<ArticyModel<'_>>, Error> {
-        Ok(self
-            .file
+    fn get_models_of_type(&self, kind: String) -> Vec<ArticyModel<'_>> {
+        self.file
             .as_ref()
-            .ok_or(Error::DatabaseNotSetup)?
+            .ok_or(Error::DatabaseNotSetup)
+            .unwrap()
             .get_models_of_type(&kind)
             .iter()
             .map(|model| ArticyModel(model))
-            .collect::<Vec<ArticyModel<'_>>>())
+            .collect::<Vec<ArticyModel<'_>>>()
     }
 }
 
@@ -128,7 +127,6 @@ impl Database {
 struct Interpreter {
     #[property]
     database_path: Option<NodePath>,
-
     interpreter: Option<ArticyInterpreter>,
 }
 
@@ -149,6 +147,11 @@ impl Interpreter {
         builder
             .signal("choices")
             .with_param("choices", VariantType::VariantArray)
+            .done();
+
+        builder
+            .signal("model")
+            .with_param("model", VariantType::Dictionary)
             .done();
 
         builder.signal("stopped").done();
@@ -177,19 +180,24 @@ impl Interpreter {
     }
 
     #[method]
-    fn start(&mut self, #[base] owner: &Node, id: String) -> Result<(), Error> {
+    fn start(&mut self, #[base] owner: &Node, id: String) {
         let interpreter = self
             .interpreter
             .as_mut()
-            .ok_or(Error::InterpreterNotSetup)?;
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap();
 
-        interpreter.start(Id(id)).ok().ok_or(Error::ArticyError)?;
+        interpreter
+            .start(Id(id))
+            .ok()
+            .ok_or(Error::ArticyError)
+            .unwrap();
 
-        let dictionary = Dictionary::new();
         let model = interpreter
             .get_current_model()
             .ok()
-            .ok_or(Error::ArticyError)?;
+            .ok_or(Error::ArticyError)
+            .unwrap();
 
         match model {
             Model::DialogueFragment {
@@ -199,6 +207,7 @@ impl Interpreter {
                 technical_name,
                 ..
             } => {
+                let dictionary = Dictionary::new();
                 dictionary.insert("line", text.to_owned());
                 dictionary.insert("id", id.to_inner());
                 dictionary.insert("speaker", speaker.to_inner());
@@ -206,20 +215,19 @@ impl Interpreter {
 
                 owner.emit_signal("line", &[Variant::new(dictionary)]);
             }
-            other_model => {
-                godot_error!("Implement start translation for {other_model:?}")
+            model => {
+                owner.emit_signal("model", &[ArticyModel(model).to_variant()]);
             }
         }
-
-        Ok(())
     }
 
     #[method]
-    fn advance(&mut self, #[base] owner: &Node) -> Result<(), Error> {
+    fn advance(&mut self, #[base] owner: &Node) {
         let interpreter = self
             .interpreter
             .as_mut()
-            .ok_or(Error::InterpreterNotSetup)?;
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap();
 
         match interpreter.advance() {
             Ok(outcome) => match outcome {
@@ -240,7 +248,7 @@ impl Interpreter {
                     owner.emit_signal("line", &[Variant::new(dictionary)]);
                 }
                 Outcome::Advanced(other_model) => {
-                    godot_error!("Implement advance translation for {other_model:?}")
+                    owner.emit_signal("model", &[ArticyModel(other_model).to_variant()]);
                 }
                 Outcome::WaitingForChoice(choices) => {
                     let array = VariantArray::new();
@@ -254,7 +262,8 @@ impl Interpreter {
                                 array.push(dictionary);
                             }
                             other_model => {
-                                godot_error!("Implement choice translation for {other_model:?}")
+                                owner
+                                    .emit_signal("model", &[ArticyModel(other_model).to_variant()]);
                             }
                         }
                     }
@@ -267,54 +276,55 @@ impl Interpreter {
             },
             Err(error) => godot_error!("Interpreter.advance() returned an error: {error:#?}"),
         }
-
-        Ok(())
     }
 
     #[method]
-    fn choose(&mut self, id: String) -> Result<(), Error> {
+    fn choose(&mut self, id: String) {
         let interpreter = self
             .interpreter
             .as_mut()
-            .ok_or(Error::InterpreterNotSetup)?;
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap();
 
-        interpreter.choose(Id(id)).ok().ok_or(Error::ArticyError)?;
-
-        Ok(())
+        interpreter
+            .choose(Id(id))
+            .ok()
+            .ok_or(Error::ArticyError)
+            .unwrap();
     }
 }
 
 struct ArticyModel<'a>(&'a Model);
 
 impl ToVariant for ArticyModel<'_> {
+    // TODO: Replace with manual deserialisation, current implementation can't rename properties consistently
     fn to_variant(&self) -> Variant {
-        let dictionary = Dictionary::new();
-
         match self.0 {
-            Model::Custom(key, value) => {
-                dictionary.insert("type", key);
+            Model::Custom(kind, value) => {
+                let json =
+                    serde_json::to_string(&serde_json::json!({"Type": kind, "Properties": value}))
+                        .expect("articy-rs to produce proper JSON");
 
-                match value {
-                    Value::Object(map) => {
-                        for key in map.keys() {
-                            match map.get(key) {
-                                Some(Value::String(string)) => dictionary.insert(key, string),
-                                _ => godot_error!(
-                                    "Implement key-value type {:?} for ToVariant",
-                                    value
-                                ),
-                            }
-                        }
-                    }
-                    _ => godot_error!("Implement value type {:?} for ToVariant", value),
+                unsafe {
+                    gdnative::api::JSON::godot_singleton()
+                        .parse(json)
+                        .expect("articy-rs JSON to be parseable by Godot")
+                        .assume_safe()
+                        .result()
                 }
             }
-            _ => godot_error!("Implement type {:?} for ToVariant", self.0),
+            _ => {
+                let json = serde_json::to_string(self.0).expect("articy-rs to produce proper JSON");
+
+                unsafe {
+                    gdnative::api::JSON::godot_singleton()
+                        .parse(json)
+                        .expect("articy-rs JSON to be parseable by Godot")
+                        .assume_safe()
+                        .result()
+                }
+            }
         }
-
-        // dictionary.insert("label", fragment.text.clone());
-
-        Variant::new(dictionary)
     }
 }
 
