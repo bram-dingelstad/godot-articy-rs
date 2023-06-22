@@ -1,5 +1,5 @@
 use articy::{
-    types::{self, File as ArticyFile, Id, Model},
+    types::{File as ArticyFile, Id, Model},
     Interpreter as ArticyInterpreter, Outcome,
 };
 use gdnative::api::PackedDataContainer;
@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 #[derive(NativeClass, Debug, Default)]
 #[inherit(Node)]
+#[register_with(Self::register_signals)]
 pub struct Database {
     #[property]
     articy_resource: Option<Ref<PackedDataContainer>>,
@@ -20,25 +21,11 @@ pub struct Dialogue {
     name: String,
 }
 
-#[derive(ToVariant, Debug)]
+#[derive(Debug)]
 pub enum Error {
     DatabaseNotSetup,
     InterpreterNotSetup,
-    ArticyError, //(articy::types::Error), //FIXME: Add articy in tuple enum and handle ToVariant requirement (ArticyError),
-}
-
-impl From<&types::Model> for Dialogue {
-    fn from(model: &types::Model) -> Dialogue {
-        match model {
-            Model::Dialogue {
-                id, display_name, ..
-            } => Dialogue {
-                id: id.to_inner(),
-                name: display_name.to_owned(),
-            },
-            _ => todo!("Implement Failure"),
-        }
-    }
+    ArticyError(articy::types::Error),
 }
 
 #[methods]
@@ -47,49 +34,62 @@ impl Database {
         Default::default()
     }
 
+    fn register_signals(builder: &ClassBuilder<Self>) {
+        builder.signal("loaded").done();
+    }
+
     #[method]
-    fn _ready(&mut self) {
+    fn _ready(&mut self, #[base] owner: &Node) {
         if let Some(resource) = &self.articy_resource {
-            let resource = unsafe { resource.assume_safe() };
+            self.load(owner, resource.clone());
+        } else if let Some(node) = owner.get_parent() {
+            let name = unsafe {
+                match node.assume_safe().get("name").dispatch() {
+                    VariantDispatch::GodotString(godot_string) => godot_string.to_string(),
+                    _ => "".to_owned(),
+                }
+            };
 
-            let data = resource
-                .get("__data__")
-                .to::<PoolArray<u8>>()
-                .expect("__data__ to be of type PoolArray<u8> (PoolByteArray)");
+            if name == "root" {
+                godot_print!("Detected as AutoLoad, attempting to read project setting \"articy/autoload_database_path\" to load resource from");
+                let settings = gdnative::api::ProjectSettings::godot_singleton();
 
-            self.load(data);
+                if settings.has_setting("articy/autoload_database_path") {
+                    let path = settings
+                        .get_setting("articy/autoload_database_path")
+                        .to_string();
+
+                    let resource = load::<gdnative::api::PackedDataContainer>(path).expect("the resource to be loaded from \"articy/autoload_database_path\" to be of type `PackedDataContainer` (as imported by the plugin).");
+
+                    self.load(owner, resource);
+                } else {
+                    godot_error!(
+                        "Your project does not have \"articy/autoload_database_path\" set."
+                    )
+                }
+            }
         }
     }
 
     #[method]
-    fn load(&mut self, bytes: PoolArray<u8>) {
+    fn load(
+        &mut self,
+        #[base] owner: &Node,
+        resource: Ref<gdnative::api::PackedDataContainer, Shared>,
+    ) {
+        let resource = unsafe { resource.assume_safe() };
+
+        let bytes = resource
+            .get("__data__")
+            .to::<PoolArray<u8>>()
+            .expect("__data__ to be of type PoolArray<u8> (PoolByteArray)");
+
         let file: ArticyFile =
             serde_json::from_slice(&bytes.to_vec()).expect("to be able to parse articy data");
 
         self.file = Some(Rc::from(file));
-    }
 
-    #[method]
-    fn get_available_dialogues(&self) -> Vec<Dialogue> {
-        // TODO: Make this relative to the current Flow context
-        if let Some(file) = &self.file {
-            let flow_id = file
-                .get_default_package()
-                .models
-                .first()
-                .expect("to find models in the default package")
-                .id();
-
-            let list = file
-                .get_dialogues_in_flow(&flow_id)
-                .iter()
-                .map(|dialogue| Dialogue::from(*dialogue))
-                .collect::<Vec<Dialogue>>();
-
-            list
-        } else {
-            vec![]
-        }
+        owner.emit_signal("loaded", &[]);
     }
 
     #[method]
@@ -160,23 +160,30 @@ impl Interpreter {
     #[method]
     fn _ready(&mut self, #[base] owner: &Node) {
         if let Some(path) = &self.database_path {
-            let node = owner
-                .get_node(path.to_godot_string())
-                .expect("To find node for path");
-
-            let file = unsafe {
-                node.assume_safe()
-                    .cast_instance::<Database>()
-                    .expect("to find a Database type from the Articy integration")
-                    .map(|data, _base| data.file.clone())
-                    .expect("to get `file` mapped from the Articy Database Rust type")
-            }
-            .expect("for the Articy Database to have a file loaded");
-
-            self.interpreter = Some(ArticyInterpreter::new(file));
-
-            godot_print!("Loaded Articy Interpreter with \"{path:?}\" as a source!");
+            self.set_database(owner, path.new_ref())
         }
+    }
+
+    #[method]
+    // TODO: Perhaps do a getter and a setter on the node_path exported property instead of a method
+    fn set_database(&mut self, #[base] owner: &Node, path: NodePath) {
+        let node = owner
+            .get_node(path.to_godot_string())
+            .expect("To find node for path");
+
+        let file = unsafe {
+            node.assume_safe()
+                .cast_instance::<Database>()
+                .expect("to find a Database type from the Articy integration")
+                .map(|data, _base| data.file.clone())
+                .expect("to get `file` mapped from the Articy Database Rust type")
+        }
+        .expect("for the Articy Database to have a file loaded");
+
+        // NOTE: You can also just add the Database in your scene instead of as an AutoLoad, and refer to it with $Database
+        self.interpreter = Some(ArticyInterpreter::new(file));
+
+        godot_print!("Loaded Articy Interpreter with \"{path:?}\" as a source!");
     }
 
     #[method]
@@ -189,14 +196,12 @@ impl Interpreter {
 
         interpreter
             .start(Id(id))
-            .ok()
-            .ok_or(Error::ArticyError)
+            .map_err(Error::ArticyError)
             .unwrap();
 
         let model = interpreter
             .get_current_model()
-            .ok()
-            .ok_or(Error::ArticyError)
+            .map_err(Error::ArticyError)
             .unwrap();
 
         match model {
@@ -288,8 +293,7 @@ impl Interpreter {
 
         interpreter
             .choose(Id(id))
-            .ok()
-            .ok_or(Error::ArticyError)
+            .map_err(Error::ArticyError)
             .unwrap();
     }
 }
