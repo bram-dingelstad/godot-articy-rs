@@ -1,6 +1,6 @@
 use articy::{
     types::{File as ArticyFile, Id, Model},
-    Interpreter as ArticyInterpreter, Outcome,
+    Interpreter as ArticyInterpreter, Outcome, StateValue,
 };
 use gdnative::api::PackedDataContainer;
 use gdnative::prelude::*;
@@ -25,6 +25,8 @@ pub struct Dialogue {
 pub enum Error {
     DatabaseNotSetup,
     InterpreterNotSetup,
+    FailedToSetState,
+    FailedToGetState,
     ArticyError(articy::types::Error),
 }
 
@@ -187,6 +189,77 @@ impl Interpreter {
     }
 
     #[method]
+    fn set_state(&mut self, key: GodotString, value: Variant) {
+        let interpreter = self
+            .interpreter
+            .as_mut()
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap();
+
+        interpreter.set_state(
+            &key.to_string(),
+            match value.dispatch() {
+                VariantDispatch::Nil => StateValue::Empty,
+                VariantDispatch::Bool(bool) => StateValue::Boolean(bool),
+                VariantDispatch::I64(integer) => StateValue::Int(integer),
+                VariantDispatch::F64(float) => StateValue::Float(float),
+                VariantDispatch::GodotString(string) => StateValue::String(string.to_string()),
+                VariantDispatch::NodePath(path) => StateValue::String(path.to_string()),
+
+                VariantDispatch::Vector2(..)
+                | VariantDispatch::Vector3(..)
+                | VariantDispatch::Quat(..)
+                | VariantDispatch::Transform2D(..)
+                | VariantDispatch::Plane(..)
+                | VariantDispatch::Aabb(..)
+                | VariantDispatch::Basis(..)
+                | VariantDispatch::Transform(..)
+                | VariantDispatch::Color(..)
+                | VariantDispatch::Rid(..)
+                | VariantDispatch::Object(..)
+                | VariantDispatch::Dictionary(..) // TODO: Might wanna serialize this to a string and store as such?
+                | VariantDispatch::VariantArray(..) // TODO: Find a usecase for arrays / tuples
+                | VariantDispatch::ByteArray(..)
+                | VariantDispatch::Int32Array(..)
+                | VariantDispatch::Float32Array(..)
+                | VariantDispatch::StringArray(..)
+                | VariantDispatch::Vector2Array(..)
+                | VariantDispatch::Vector3Array(..)
+                | VariantDispatch::ColorArray(..)
+                | VariantDispatch::Rect2(..) => panic!("Type not supported for serialisation in Articy"),
+            },
+        )
+        .ok()
+        .ok_or(Error::FailedToSetState)
+        .unwrap()
+    }
+
+    #[method]
+    fn get_state(&mut self, key: GodotString) -> Variant {
+        let interpreter = self
+            .interpreter
+            .as_mut()
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap();
+
+        match interpreter
+            .get_state(&key.to_string())
+            .ok()
+            .ok_or(Error::FailedToGetState)
+            .unwrap()
+        {
+            StateValue::String(string) => Variant::new(GodotString::from_str(string)),
+            StateValue::Float(float) => Variant::new(float),
+            StateValue::Int(int) => Variant::new(int),
+            StateValue::Boolean(bool) => Variant::new(bool),
+            StateValue::Empty => Variant::nil(),
+            StateValue::Tuple(..) => {
+                unimplemented!("did not implement recursion to deserialize arrays")
+            }
+        }
+    }
+
+    #[method]
     fn start(&mut self, #[base] owner: &Node, id: String) {
         let interpreter = self
             .interpreter
@@ -302,6 +375,7 @@ struct ArticyModel<'a>(&'a Model);
 
 impl ToVariant for ArticyModel<'_> {
     // TODO: Replace with manual deserialisation, current implementation can't rename properties consistently
+    // TODO: Maybe replace Type / Properties with a flat "Properties" dictionary with a "type" key
     fn to_variant(&self) -> Variant {
         match self.0 {
             Model::Custom(kind, value) => {
