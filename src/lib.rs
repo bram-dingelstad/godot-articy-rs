@@ -369,6 +369,22 @@ impl Interpreter {
             .map_err(Error::ArticyError)
             .unwrap();
     }
+
+    #[method]
+    fn exhaust_maximally(&mut self, #[base] owner: &Node) {
+        let interpreter = self
+            .interpreter
+            .as_mut()
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap();
+
+        interpreter
+            .exhaust_maximally()
+            .map_err(Error::ArticyError)
+            .unwrap();
+
+        self.advance(owner)
+    }
 }
 
 struct ArticyModel<'a>(&'a Model);
