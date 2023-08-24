@@ -121,6 +121,22 @@ impl Database {
             .map(|model| ArticyModel(model))
             .collect::<Vec<ArticyModel<'_>>>()
     }
+
+    #[method]
+    fn get_model_by_external_id(&self, external_id: String) -> Option<ArticyModel<'_>> {
+        self.file
+            .as_ref()?
+            .get_default_package()
+            .models
+            .iter()
+            .find_map(|model| {
+                if model.external_id().to_inner() == external_id {
+                    Some(ArticyModel(model))
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 #[derive(NativeClass, Default)]
