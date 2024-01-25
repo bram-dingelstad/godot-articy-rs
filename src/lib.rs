@@ -86,11 +86,7 @@ impl Database {
             .to::<PoolArray<u8>>()
             .expect("__data__ to be of type PoolArray<u8> (PoolByteArray)");
 
-        let file: ArticyFile =
-            serde_json::from_slice(&bytes.to_vec()).expect("to be able to parse articy data");
-
-        self.file = Some(Rc::from(file));
-
+        self.file = Some(Rc::from(ArticyFile::from_buffer(&bytes.to_vec())));
         owner.emit_signal("loaded", &[]);
     }
 
@@ -136,6 +132,66 @@ impl Database {
                     None
                 }
             })
+    }
+
+    #[method]
+    fn get_all_models(&self) -> Vec<ArticyModel<'_>> {
+        self.file
+            .as_ref()
+            .ok_or(Error::DatabaseNotSetup)
+            .unwrap()
+            .get_models()
+            .iter()
+            .map(|model| ArticyModel(model))
+            .collect::<Vec<ArticyModel<'_>>>()
+    }
+
+    #[method]
+    fn get_entity_ids_from_folder(&self, folder_id: String) -> Vec<String> {
+        let model = self
+            .get_model(folder_id.clone())
+            .expect("to find model for folder_id")
+            .0;
+        if let Model::UserFolder { .. } = model {
+            model
+        } else {
+            panic!("{folder_id:?} isn't a UserFolder, therefor get can't get entities")
+        };
+
+        let hierarchy_path = self
+            .file
+            .as_ref()
+            .ok_or(Error::DatabaseNotSetup)
+            .unwrap()
+            .get_hierarchy_path_from_model(model)
+            .expect("to find hierarchy path for model");
+
+        let hierarchy = self
+            .file
+            .as_ref()
+            .ok_or(Error::DatabaseNotSetup)
+            .unwrap()
+            .get_hierarchy(hierarchy_path)
+            .expect("to get valid hierarchy for hierachy_path");
+
+        hierarchy
+            .children
+            .as_ref()
+            .expect("hierarchy to have children")
+            .into_iter()
+            .map(|hierarchy| hierarchy.id.clone().to_inner())
+            .collect::<Vec<String>>()
+    }
+
+    #[method]
+    fn get_entities_from_folder(&self, folder_id: String) -> Vec<ArticyModel<'_>> {
+        self.get_entity_ids_from_folder(folder_id)
+            .into_iter()
+            .map(|id| {
+                self.get_model(id)
+                    .expect("to find model for id that is part of entity folder")
+            })
+            .collect::<Vec<ArticyModel<'_>>>()
     }
 }
 
@@ -251,6 +307,18 @@ impl Interpreter {
     }
 
     #[method]
+    fn print_state(&self) {
+        let state = &self
+            .interpreter
+            .as_ref()
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap()
+            .state;
+
+        godot_print!("{state:#?}");
+    }
+
+    #[method]
     fn get_state(&mut self, key: GodotString) -> Variant {
         let interpreter = self
             .interpreter
@@ -299,6 +367,7 @@ impl Interpreter {
                 id,
                 speaker,
                 technical_name,
+                template,
                 ..
             } => {
                 let dictionary = Dictionary::new();
@@ -306,6 +375,18 @@ impl Interpreter {
                 dictionary.insert("id", id.to_inner());
                 dictionary.insert("speaker", speaker.to_inner());
                 dictionary.insert("technical_name", technical_name.to_owned());
+
+                if let Some(template) = template {
+                    let json = unsafe {
+                        gdnative::api::JSON::godot_singleton()
+                            .parse(serde_json::to_string(template).unwrap())
+                            .unwrap()
+                            .assume_safe()
+                            .result()
+                    };
+
+                    dictionary.insert("template", json);
+                }
 
                 owner.emit_signal("line", &[Variant::new(dictionary)]);
             }
@@ -317,73 +398,30 @@ impl Interpreter {
 
     #[method]
     fn advance(&mut self, #[base] owner: &Node) {
-        let interpreter = self
+        match self
             .interpreter
             .as_mut()
             .ok_or(Error::InterpreterNotSetup)
-            .unwrap();
-
-        match interpreter.advance() {
-            Ok(outcome) => match outcome {
-                Outcome::Advanced(Model::DialogueFragment {
-                    id,
-                    text,
-                    speaker,
-                    technical_name,
-                    ..
-                }) => {
-                    let dictionary = Dictionary::new();
-
-                    dictionary.insert("id", id.to_inner());
-                    dictionary.insert("line", text.to_owned());
-                    dictionary.insert("speaker", speaker.to_inner());
-                    dictionary.insert("technical_name", technical_name.to_owned());
-
-                    owner.emit_signal("line", &[Variant::new(dictionary)]);
-                }
-                Outcome::Advanced(other_model) => {
-                    owner.emit_signal("model", &[ArticyModel(other_model).to_variant()]);
-                }
-                Outcome::WaitingForChoice(choices) => {
-                    let array = VariantArray::new();
-                    for choice in choices {
-                        let dictionary = Dictionary::new();
-                        match choice {
-                            Model::DialogueFragment { text, id, .. } => {
-                                dictionary.insert("label", text.to_owned());
-                                dictionary.insert("id", id.to_inner());
-
-                                array.push(dictionary);
-                            }
-                            other_model => {
-                                owner
-                                    .emit_signal("model", &[ArticyModel(other_model).to_variant()]);
-                            }
-                        }
-                    }
-
-                    owner.emit_signal("choices", &[Variant::new(array)]);
-                }
-                Outcome::Stopped | Outcome::EndOfDialogue => {
-                    owner.emit_signal("stopped", &[]);
-                }
-            },
-            Err(error) => godot_error!("Interpreter.advance() returned an error: {error:#?}"),
+            .unwrap()
+            .advance()
+        {
+            Ok(outcome) => handle_outcome(owner, outcome),
+            Err(error) => godot_error!("Got an error from using Interpreter.advance(): {error:#?}"),
         }
     }
 
     #[method]
-    fn choose(&mut self, id: String) {
+    fn choose(&mut self, #[base] owner: &Node, id: String) {
         let interpreter = self
             .interpreter
             .as_mut()
             .ok_or(Error::InterpreterNotSetup)
             .unwrap();
 
-        interpreter
-            .choose(Id(id))
-            .map_err(Error::ArticyError)
-            .unwrap();
+        match interpreter.choose(Id(id)) {
+            Ok(outcome) => handle_outcome(owner, outcome),
+            Err(error) => godot_error!("Got an error from using Interpreter.choose(): {error:#?}"),
+        }
     }
 
     #[method]
@@ -438,8 +476,80 @@ impl ToVariant for ArticyModel<'_> {
     }
 }
 
+fn handle_outcome(owner: &Node, outcome: Outcome) {
+    match outcome {
+        Outcome::Advanced(Model::DialogueFragment {
+            id,
+            text,
+            speaker,
+            technical_name,
+            template,
+            ..
+        }) => {
+            let dictionary = Dictionary::new();
+
+            dictionary.insert("id", id.to_inner());
+            dictionary.insert("line", text.to_owned());
+            dictionary.insert("speaker", speaker.to_inner());
+            dictionary.insert("technical_name", technical_name.to_owned());
+
+            if let Some(template) = template {
+                let json = unsafe {
+                    gdnative::api::JSON::godot_singleton()
+                        .parse(serde_json::to_string(template).unwrap())
+                        .unwrap()
+                        .assume_safe()
+                        .result()
+                };
+
+                dictionary.insert("template", json);
+            }
+
+            owner.emit_signal("line", &[Variant::new(dictionary)]);
+        }
+        Outcome::Advanced(other_model) => {
+            owner.emit_signal("model", &[ArticyModel(other_model).to_variant()]);
+        }
+        Outcome::WaitingForChoice(choices) => {
+            let array = VariantArray::new();
+            for choice in choices {
+                let dictionary = Dictionary::new();
+                match choice {
+                    Model::DialogueFragment {
+                        menu_text,
+                        id,
+                        text,
+                        ..
+                    } => {
+                        dictionary.insert(
+                            "label",
+                            if menu_text.is_empty() {
+                                text
+                            } else {
+                                menu_text
+                            }
+                            .to_owned(),
+                        );
+                        dictionary.insert("id", id.to_inner());
+
+                        array.push(dictionary);
+                    }
+                    other_model => {
+                        owner.emit_signal("model", &[ArticyModel(other_model).to_variant()]);
+                    }
+                }
+            }
+
+            owner.emit_signal("choices", &[Variant::new(array)]);
+        }
+        Outcome::Stopped | Outcome::EndOfDialogue => {
+            owner.emit_signal("stopped", &[]);
+        }
+    }
+}
+
 fn init(handle: InitHandle) {
-    handle.add_class::<Database>();
+    handle.add_tool_class::<Database>();
     handle.add_class::<Interpreter>();
 }
 
