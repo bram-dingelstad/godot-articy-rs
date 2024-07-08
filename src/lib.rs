@@ -519,6 +519,7 @@ fn handle_outcome(owner: &Node, outcome: Outcome) {
                         menu_text,
                         id,
                         text,
+                        template,
                         ..
                     } => {
                         dictionary.insert(
@@ -531,6 +532,17 @@ fn handle_outcome(owner: &Node, outcome: Outcome) {
                             .to_owned(),
                         );
                         dictionary.insert("id", id.to_inner());
+                        if let Some(template) = template {
+                            let json = unsafe {
+                                gdnative::api::JSON::godot_singleton()
+                                    .parse(serde_json::to_string(template).unwrap())
+                                    .unwrap()
+                                    .assume_safe()
+                                    .result()
+                            };
+
+                            dictionary.insert("template", json);
+                        }
 
                         array.push(dictionary);
                     }
