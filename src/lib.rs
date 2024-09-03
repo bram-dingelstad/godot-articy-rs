@@ -193,6 +193,32 @@ impl Database {
             })
             .collect::<Vec<ArticyModel<'_>>>()
     }
+
+    #[method]
+    fn get_first_dialogue_fragment_of_dialogue(&self, id: String) -> Option<ArticyModel<'_>> {
+        let get_model = |id: String| {
+            self.file
+                .as_ref()?
+                .get_default_package()
+                .models
+                .iter()
+                .find_map(|model| {
+                    if model.id().to_inner() == id {
+                        Some(model)
+                    } else {
+                        None
+                    }
+                })
+        };
+
+        Some(ArticyModel(get_model(
+            self.file
+                .as_ref()?
+                .get_first_dialogue_fragment_of_dialogue(get_model(id)?)
+                .ok()?
+                .to_inner(),
+        )?))
+    }
 }
 
 #[derive(NativeClass, Default)]
@@ -425,6 +451,27 @@ impl Interpreter {
     }
 
     #[method]
+    fn get_connections(&self, #[base] _owner: &Node, id: Variant) -> Variant {
+        let interpreter = self
+            .interpreter
+            .as_ref()
+            .ok_or(Error::InterpreterNotSetup)
+            .unwrap();
+
+        VariantArray::from_iter(
+            if id.is_nil() {
+                interpreter.get_available_connections_at_cursor()
+            } else {
+                interpreter.get_available_connections(&Id(id.to_string()))
+            }
+            .unwrap()
+            .into_iter()
+            .map(|model| ArticyModel(model).to_variant()),
+        )
+        .owned_to_variant()
+    }
+
+    #[method]
     fn exhaust_maximally(&mut self, #[base] owner: &Node) {
         let interpreter = self
             .interpreter
@@ -450,7 +497,7 @@ impl ToVariant for ArticyModel<'_> {
         match self.0 {
             Model::Custom(kind, value) => {
                 let json =
-                    serde_json::to_string(&serde_json::json!({"Type": kind, "Properties": value}))
+                    serde_json::to_string(&serde_json::json!({"type": kind, "properties": value}))
                         .expect("articy-rs to produce proper JSON");
 
                 unsafe {
